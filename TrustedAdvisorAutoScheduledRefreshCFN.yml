@@ -1,0 +1,357 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Trusted Advisor Auto Refresh Example with AWS Step Functions'
+Parameters: 
+  SNSEmailAddress:
+    Type: String
+    AllowedPattern: '[^@]+@[^@]+\.[^@]+'
+    Description: Enter an email address to which you want to send Trusted Advisor refresh notifications. 
+  MaxTrustedAdvisorRefreshConcurrency:
+    Type: Number
+    Description: '(Default: 50) Enter a max Trusted Advisor refresh concurrency' 
+    MinValue: '1'
+    MaxValue: '90'
+    Default: '50'
+  Days:
+    Type: Number
+    Description: '(Default: 7) Specify how often an EventBridge rule should be invoked (in days)'
+    MinValue: '1'
+    Default: '7'
+  Language:
+    Type: String
+    Description: '(Default: en) Specify the Trusted Advisor check language'
+    Default: 'en'
+    AllowedValues: 
+      - zh
+      - zh_TW
+      - en
+      - fr
+      - de
+      - id
+      - it
+      - ja
+      - ko
+      - pt_BR
+      - es
+
+Resources:
+  # SNS Topic
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties: 
+      DisplayName: Trusted Advisor Refresh Notification
+  SNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Ref 'SNSEmailAddress'
+      Protocol: email
+      TopicArn: !Ref 'SNSTopic'
+  # IAM roles
+  StepFunctionsIAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: !Sub 'states.${AWS::Region}.amazonaws.com'
+          Action: 'sts:AssumeRole'
+      Policies:
+      - PolicyName: RefreshTrustedAdvisor
+        PolicyDocument: 
+          Statement: 
+          - Effect: Allow
+            Action: 
+              - 'support:RefreshTrustedAdvisorCheck'
+            Resource: '*'
+      - PolicyName: InvokeLambda
+        PolicyDocument: 
+          Statement: 
+          - Effect: Allow
+            Action: 
+              - 'lambda:InvokeFunction'
+            Resource: 
+            - !GetAtt 'LambdaFunctionCheckTrustedAdvisorChecks.Arn'
+            - !GetAtt 'LambdaFunctionFormatSNS.Arn'
+  TALambdaIAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: !Sub 'lambda.${AWS::Region}.amazonaws.com'
+          Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+      - PolicyName: TrustedAdvisorChecks
+        PolicyDocument: 
+          Statement: 
+          - Effect: Allow
+            Action: 
+              - 'support:DescribeTrustedAdvisorChecks'
+            Resource: '*'
+  SNSLambdaIAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: !Sub 'lambda.${AWS::Region}.amazonaws.com'
+          Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+      - PolicyName: SNSPublish
+        PolicyDocument: 
+          Statement: 
+          - Effect: Allow
+            Action: 
+              - 'sns:Publish'
+            Resource: !Ref 'SNSTopic'
+  # Lambda
+  LambdaFunctionCheckTrustedAdvisorChecks:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Role: !GetAtt 'TALambdaIAMRole.Arn'
+      Handler: index.lambda_handler
+      Timeout: 20
+      Environment:
+        Variables: 
+          Language: !Ref Language
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          import logging
+
+          client = boto3.client('support')
+          lang = os.environ['Language']
+          def lambda_handler(event, context):
+              try:
+                  response = client.describe_trusted_advisor_checks(
+                      language=lang
+                  )
+              except Exception as e: 
+                  logging.error("Unexpected error while describing trusted advisor checks")
+                  raise e
+              # Extracting TA check IDs only to minimize the payload size
+              ta_checks = [i['id'] for i in response['checks']]
+              logging.info(ta_checks)
+              return {
+                  'ta_check_ids': ta_checks 
+              }
+      Description: Invoked by Step Functions to describe Trusted Advisor checks
+
+  # Lambda
+  LambdaFunctionFormatSNS:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Role: !GetAtt 'SNSLambdaIAMRole.Arn'
+      Handler: index.lambda_handler
+      Timeout: 10
+      Environment:
+        Variables: 
+          SnsArn: !Ref 'SNSTopic'
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+          import os
+          from datetime import date
+
+          sns_arn = os.environ['SnsArn']
+          sns_client = boto3.client("sns")
+
+          def lambda_handler(event, context):
+              message = json.dumps(event, indent=4, sort_keys=False)
+              today = date.today()
+              subject = "[{0}] Trusted Advisor Refresh Report".format(str(today))
+              logging.info("Email subject: {0}".format(subject))
+              try:
+                  logging.info("Sending an email to the SNS topic: {0}".format(sns_arn))
+                  sns_client.publish(TopicArn=sns_arn, Message=message, Subject=subject)
+              except Exception as e:
+                  logging.error("Unexpected error while making an SNS:Publish API call")
+                  raise e
+              return {
+                  'SNSPublish': "Success",
+                  'SNSARN': sns_arn
+              }
+      Description: Invoked by Step Functions to describe Trusted Advisor checks
+
+  # Step Functions
+  TrustedAdvisorStateMachine:
+    Type: 'AWS::StepFunctions::StateMachine'
+    Properties:
+      DefinitionString: !Sub |
+        {
+            "Comment": "State machine that describes Trusted Advisor checks, refreshes them and sends a notification via SNS.",
+            "StartAt": "DescribeTrustedAdvisorChecks",
+            "States": {
+              "DescribeTrustedAdvisorChecks": {
+                "Type": "Task",
+                "Resource": "arn:${AWS::Partition}:states:::lambda:invoke",
+                "OutputPath": "$.Payload",
+                "Parameters": {
+                  "Payload.$": "$",
+                  "FunctionName": "${LambdaFunctionCheckTrustedAdvisorChecks}"
+                },
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "Lambda.ServiceException",
+                      "Lambda.AWSLambdaException",
+                      "Lambda.SdkClientException",
+                      "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 6,
+                    "BackoffRate": 2
+                  }
+                ],
+                "Next": "Map"
+              },
+              "Map": {
+                "Type": "Map",
+                "Iterator": {
+                  "StartAt": "RefreshTrustedAdvisorCheck",
+                  "States": {
+                    "RefreshTrustedAdvisorCheck": {
+                      "Type": "Task",
+                      "Parameters": {
+                        "CheckId.$": "$"
+                      },
+                      "Resource": "arn:${AWS::Partition}:states:::aws-sdk:support:refreshTrustedAdvisorCheck",
+                      "ResultSelector": {
+                        "CheckId.$": "$.Status.CheckId",
+                        "Status.$": "$.Status.Status"
+                      },
+                      "Catch": [
+                        {
+                          "ErrorEquals": [
+                            "Support.SupportException"
+                          ],
+                          "Next": "Choice"
+                        }
+                      ],
+                      "End": true,
+                      "Retry": [
+                        {
+                          "ErrorEquals": [
+                            "States.ALL"
+                          ],
+                          "BackoffRate": 2,
+                          "IntervalSeconds": 1,
+                          "MaxAttempts": 2
+                        }
+                      ],
+                      "Comment": "Refresh trusted advisor check using RefreshTrustedAdvisorCheck API"
+                    },
+                    "Choice": {
+                      "Type": "Choice",
+                      "Choices": [
+                        {
+                          "Variable": "$.Cause",
+                          "StringMatches": "[UNREFRESHABLE_CHECK_ID_ERROR]*",
+                          "Next": "Pass"
+                        }
+                      ],
+                      "Default": "Fail",
+                      "Comment": "Validate whether Support.SupportException failure is due to check ID being unrefreshable"
+                    },
+                    "Fail": {
+                      "Type": "Fail",
+                      "Error": "Support.SupportException",
+                      "Cause": "$.Cause",
+                      "Comment": "Unexpected support exception"
+                    },
+                    "Pass": {
+                      "Type": "Pass",
+                      "End": true,
+                      "Comment": "Passing for unrefreshale support exception"
+                    }
+                  }
+                },
+                "MaxConcurrency": ${MaxTrustedAdvisorRefreshConcurrency},
+                "ItemsPath": "$.ta_check_ids",
+                "Next": "SNS Publish",
+                "Catch": [
+                  {
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "Next": "SNS Publish"
+                  }
+                ],
+                "Comment": "Iterate over the list of checks from DescribeTrustedAdvisorChecks state to refresh each check"
+              },
+              "SNS Publish": {
+                "Type": "Task",
+                "Resource": "arn:${AWS::Partition}:states:::lambda:invoke",
+                "OutputPath": "$.Payload",
+                "Parameters": {
+                  "Payload.$": "$",
+                  "FunctionName": "${LambdaFunctionFormatSNS}"
+                },
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "Lambda.ServiceException",
+                      "Lambda.AWSLambdaException",
+                      "Lambda.SdkClientException",
+                      "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 6,
+                    "BackoffRate": 2
+                  }
+                ],
+                "End": true,
+                "Comment": "SNS notification for successful executions"
+              }
+            }
+          }
+      RoleArn: !GetAtt 'StepFunctionsIAMRole.Arn'
+
+
+  # IAM roles for EventBridge
+  EventBridgeIAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: !Sub 'events.amazonaws.com'
+          Action: 'sts:AssumeRole'
+      Policies:
+      - PolicyName: EventBridgeToInvokeStepFunctions
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action: 'states:StartExecution'
+            Resource:
+            - !GetAtt 'TrustedAdvisorStateMachine.Arn'
+
+  # EventBridge
+  EventBridgeCronJob:
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "ScheduledRule"
+      ScheduleExpression: !Sub "rate(${Days} days)"
+      State: "ENABLED"
+      RoleArn: !GetAtt 'EventBridgeIAMRole.Arn'
+      Targets: 
+        - Arn: !GetAtt 'TrustedAdvisorStateMachine.Arn'
+          Id: 'TrustedAdvisorStateMachine'
+          RoleArn: !GetAtt 'EventBridgeIAMRole.Arn'
